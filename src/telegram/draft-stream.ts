@@ -1,139 +1,305 @@
 import type { Bot } from "grammy";
+import { createFinalizableDraftLifecycle } from "../channels/draft-stream-controls.js";
 import { buildTelegramThreadParams, type TelegramThreadSpec } from "./bot/helpers.js";
 
-const TELEGRAM_DRAFT_MAX_CHARS = 4096;
-const DEFAULT_THROTTLE_MS = 300;
+const TELEGRAM_STREAM_MAX_CHARS = 4096;
+const DEFAULT_THROTTLE_MS = 1000;
+const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
+const THREAD_NOT_FOUND_RE = /400:\s*Bad Request:\s*message thread not found/i;
+
+type TelegramSendMessageDraft = (
+  chatId: number,
+  draftId: number,
+  text: string,
+  params?: {
+    message_thread_id?: number;
+    parse_mode?: "HTML";
+  },
+) => Promise<unknown>;
+
+let nextDraftId = 0;
+
+function allocateTelegramDraftId(): number {
+  nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
+  return nextDraftId;
+}
+
+function resolveSendMessageDraftApi(api: Bot["api"]): TelegramSendMessageDraft | undefined {
+  const sendMessageDraft = (api as Bot["api"] & { sendMessageDraft?: TelegramSendMessageDraft })
+    .sendMessageDraft;
+  if (typeof sendMessageDraft !== "function") {
+    return undefined;
+  }
+  return sendMessageDraft.bind(api as object);
+}
 
 export type TelegramDraftStream = {
   update: (text: string) => void;
   flush: () => Promise<void>;
-  stop: () => void;
+  messageId: () => number | undefined;
+  previewMode?: () => "message" | "draft";
+  previewRevision?: () => number;
+  clear: () => Promise<void>;
+  stop: () => Promise<void>;
+  /** Reset internal state so the next update creates a new message instead of editing. */
+  forceNewMessage: () => void;
+};
+
+type TelegramDraftPreview = {
+  text: string;
+  parseMode?: "HTML";
+};
+
+type SupersededTelegramPreview = {
+  messageId: number;
+  textSnapshot: string;
+  parseMode?: "HTML";
 };
 
 export function createTelegramDraftStream(params: {
   api: Bot["api"];
   chatId: number;
-  draftId: number;
   maxChars?: number;
   thread?: TelegramThreadSpec | null;
+  previewTransport?: "auto" | "message" | "draft";
+  replyToMessageId?: number;
   throttleMs?: number;
+  /** Minimum chars before sending first message (debounce for push notifications) */
+  minInitialChars?: number;
+  /** Optional preview renderer (e.g. markdown -> HTML + parse mode). */
+  renderText?: (text: string) => TelegramDraftPreview;
+  /** Called when a late send resolves after forceNewMessage() switched generations. */
+  onSupersededPreview?: (preview: SupersededTelegramPreview) => void;
   log?: (message: string) => void;
   warn?: (message: string) => void;
 }): TelegramDraftStream {
-  const maxChars = Math.min(params.maxChars ?? TELEGRAM_DRAFT_MAX_CHARS, TELEGRAM_DRAFT_MAX_CHARS);
-  const throttleMs = Math.max(50, params.throttleMs ?? DEFAULT_THROTTLE_MS);
-  const rawDraftId = Number.isFinite(params.draftId) ? Math.trunc(params.draftId) : 1;
-  const draftId = rawDraftId === 0 ? 1 : Math.abs(rawDraftId);
+  const maxChars = Math.min(
+    params.maxChars ?? TELEGRAM_STREAM_MAX_CHARS,
+    TELEGRAM_STREAM_MAX_CHARS,
+  );
+  const throttleMs = Math.max(250, params.throttleMs ?? DEFAULT_THROTTLE_MS);
+  const minInitialChars = params.minInitialChars;
   const chatId = params.chatId;
+  const requestedPreviewTransport = params.previewTransport ?? "auto";
+  const prefersDraftTransport =
+    requestedPreviewTransport === "draft"
+      ? true
+      : requestedPreviewTransport === "message"
+        ? false
+        : params.thread?.scope === "dm";
   const threadParams = buildTelegramThreadParams(params.thread);
+  const replyParams =
+    params.replyToMessageId != null
+      ? { ...threadParams, reply_to_message_id: params.replyToMessageId }
+      : threadParams;
+  const resolvedDraftApi = prefersDraftTransport
+    ? resolveSendMessageDraftApi(params.api)
+    : undefined;
+  const usesDraftTransport = Boolean(prefersDraftTransport && resolvedDraftApi);
+  if (prefersDraftTransport && !usesDraftTransport) {
+    params.warn?.(
+      "telegram stream preview: sendMessageDraft unavailable; falling back to sendMessage/editMessageText",
+    );
+  }
 
+  const streamState = { stopped: false, final: false };
+  let streamMessageId: number | undefined;
+  let streamDraftId = usesDraftTransport ? allocateTelegramDraftId() : undefined;
   let lastSentText = "";
-  let lastSentAt = 0;
-  let pendingText = "";
-  let inFlight = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let stopped = false;
+  let lastSentParseMode: "HTML" | undefined;
+  let previewRevision = 0;
+  let generation = 0;
+  const sendStreamPreview = usesDraftTransport
+    ? async ({
+        renderedText,
+        renderedParseMode,
+      }: {
+        renderedText: string;
+        renderedParseMode: "HTML" | undefined;
+        sendGeneration: number;
+      }): Promise<boolean> => {
+        const draftId = streamDraftId ?? allocateTelegramDraftId();
+        streamDraftId = draftId;
+        const draftParams = {
+          ...(threadParams?.message_thread_id != null
+            ? { message_thread_id: threadParams.message_thread_id }
+            : {}),
+          ...(renderedParseMode ? { parse_mode: renderedParseMode } : {}),
+        };
+        await resolvedDraftApi!(
+          chatId,
+          draftId,
+          renderedText,
+          Object.keys(draftParams).length > 0 ? draftParams : undefined,
+        );
+        return true;
+      }
+    : async ({
+        renderedText,
+        renderedParseMode,
+        sendGeneration,
+      }: {
+        renderedText: string;
+        renderedParseMode: "HTML" | undefined;
+        sendGeneration: number;
+      }): Promise<boolean> => {
+        if (typeof streamMessageId === "number") {
+          if (renderedParseMode) {
+            await params.api.editMessageText(chatId, streamMessageId, renderedText, {
+              parse_mode: renderedParseMode,
+            });
+          } else {
+            await params.api.editMessageText(chatId, streamMessageId, renderedText);
+          }
+          return true;
+        }
+        const sendParams = renderedParseMode
+          ? {
+              ...replyParams,
+              parse_mode: renderedParseMode,
+            }
+          : replyParams;
+        let sent;
+        try {
+          sent = await params.api.sendMessage(chatId, renderedText, sendParams);
+        } catch (err) {
+          const hasThreadParam =
+            "message_thread_id" in (sendParams ?? {}) &&
+            typeof (sendParams as { message_thread_id?: unknown }).message_thread_id === "number";
+          if (!hasThreadParam || !THREAD_NOT_FOUND_RE.test(String(err))) {
+            throw err;
+          }
+          const threadlessParams = {
+            ...(sendParams as Record<string, unknown>),
+          };
+          delete threadlessParams.message_thread_id;
+          params.warn?.(
+            "telegram stream preview send failed with message_thread_id, retrying without thread",
+          );
+          sent = await params.api.sendMessage(
+            chatId,
+            renderedText,
+            Object.keys(threadlessParams).length > 0 ? threadlessParams : undefined,
+          );
+        }
+        const sentMessageId = sent?.message_id;
+        if (typeof sentMessageId !== "number" || !Number.isFinite(sentMessageId)) {
+          streamState.stopped = true;
+          params.warn?.("telegram stream preview stopped (missing message id from sendMessage)");
+          return false;
+        }
+        const normalizedMessageId = Math.trunc(sentMessageId);
+        if (sendGeneration !== generation) {
+          params.onSupersededPreview?.({
+            messageId: normalizedMessageId,
+            textSnapshot: renderedText,
+            parseMode: renderedParseMode,
+          });
+          return true;
+        }
+        streamMessageId = normalizedMessageId;
+        return true;
+      };
 
-  const sendDraft = async (text: string) => {
-    if (stopped) {
-      return;
+  const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
+    // Allow final flush even if stopped (e.g., after clear()).
+    if (streamState.stopped && !streamState.final) {
+      return false;
     }
     const trimmed = text.trimEnd();
     if (!trimmed) {
-      return;
+      return false;
     }
-    if (trimmed.length > maxChars) {
-      // Drafts are capped at 4096 chars. Stop streaming once we exceed the cap
-      // so we don't keep sending failing updates or a truncated preview.
-      stopped = true;
-      params.warn?.(`telegram draft stream stopped (draft length ${trimmed.length} > ${maxChars})`);
-      return;
+    const rendered = params.renderText?.(trimmed) ?? { text: trimmed };
+    const renderedText = rendered.text.trimEnd();
+    const renderedParseMode = rendered.parseMode;
+    if (!renderedText) {
+      return false;
     }
-    if (trimmed === lastSentText) {
-      return;
-    }
-    lastSentText = trimmed;
-    lastSentAt = Date.now();
-    try {
-      await params.api.sendMessageDraft(chatId, draftId, trimmed, threadParams);
-    } catch (err) {
-      stopped = true;
+    if (renderedText.length > maxChars) {
+      // Telegram text messages/edits cap at 4096 chars.
+      // Stop streaming once we exceed the cap to avoid repeated API failures.
+      streamState.stopped = true;
       params.warn?.(
-        `telegram draft stream failed: ${err instanceof Error ? err.message : String(err)}`,
+        `telegram stream preview stopped (text length ${renderedText.length} > ${maxChars})`,
       );
+      return false;
     }
-  };
+    if (renderedText === lastSentText && renderedParseMode === lastSentParseMode) {
+      return true;
+    }
+    const sendGeneration = generation;
 
-  const flush = async () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = undefined;
-    }
-    if (inFlight) {
-      schedule();
-      return;
-    }
-    const text = pendingText;
-    const trimmed = text.trim();
-    if (!trimmed) {
-      if (pendingText === text) {
-        pendingText = "";
+    // Debounce first preview send for better push notification quality.
+    if (typeof streamMessageId !== "number" && minInitialChars != null && !streamState.final) {
+      if (renderedText.length < minInitialChars) {
+        return false;
       }
-      if (pendingText) {
-        schedule();
-      }
-      return;
     }
-    pendingText = "";
-    inFlight = true;
+
+    lastSentText = renderedText;
+    lastSentParseMode = renderedParseMode;
     try {
-      await sendDraft(text);
-    } finally {
-      inFlight = false;
-    }
-    if (pendingText) {
-      schedule();
-    }
-  };
-
-  const schedule = () => {
-    if (timer) {
-      return;
-    }
-    const delay = Math.max(0, throttleMs - (Date.now() - lastSentAt));
-    timer = setTimeout(() => {
-      void flush();
-    }, delay);
-  };
-
-  const update = (text: string) => {
-    if (stopped) {
-      return;
-    }
-    pendingText = text;
-    if (inFlight) {
-      schedule();
-      return;
-    }
-    if (!timer && Date.now() - lastSentAt >= throttleMs) {
-      void flush();
-      return;
-    }
-    schedule();
-  };
-
-  const stop = () => {
-    stopped = true;
-    pendingText = "";
-    if (timer) {
-      clearTimeout(timer);
-      timer = undefined;
+      const sent = await sendStreamPreview({
+        renderedText,
+        renderedParseMode,
+        sendGeneration,
+      });
+      if (sent) {
+        previewRevision += 1;
+      }
+      return sent;
+    } catch (err) {
+      streamState.stopped = true;
+      params.warn?.(
+        `telegram stream preview failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
     }
   };
 
-  params.log?.(
-    `telegram draft stream ready (draftId=${draftId}, maxChars=${maxChars}, throttleMs=${throttleMs})`,
-  );
+  const { loop, update, stop, clear } = createFinalizableDraftLifecycle({
+    throttleMs,
+    state: streamState,
+    sendOrEditStreamMessage,
+    readMessageId: () => streamMessageId,
+    clearMessageId: () => {
+      streamMessageId = undefined;
+    },
+    isValidMessageId: (value): value is number =>
+      typeof value === "number" && Number.isFinite(value),
+    deleteMessage: async (messageId) => {
+      await params.api.deleteMessage(chatId, messageId);
+    },
+    onDeleteSuccess: (messageId) => {
+      params.log?.(`telegram stream preview deleted (chat=${chatId}, message=${messageId})`);
+    },
+    warn: params.warn,
+    warnPrefix: "telegram stream preview cleanup failed",
+  });
 
-  return { update, flush, stop };
+  const forceNewMessage = () => {
+    generation += 1;
+    streamMessageId = undefined;
+    if (usesDraftTransport) {
+      streamDraftId = allocateTelegramDraftId();
+    }
+    lastSentText = "";
+    lastSentParseMode = undefined;
+    loop.resetPending();
+    loop.resetThrottleWindow();
+  };
+
+  params.log?.(`telegram stream preview ready (maxChars=${maxChars}, throttleMs=${throttleMs})`);
+
+  return {
+    update,
+    flush: loop.flush,
+    messageId: () => streamMessageId,
+    previewMode: () => (usesDraftTransport ? "draft" : "message"),
+    previewRevision: () => previewRevision,
+    clear,
+    stop,
+    forceNewMessage,
+  };
 }
