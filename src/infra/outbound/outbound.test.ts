@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { discordPlugin } from "../../../extensions/discord/src/channel.js";
 import type { ReplyPayload } from "../../auto-reply/types.js";
+import { setDefaultChannelPluginRegistryForTests } from "../../commands/channel-test-helpers.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { typedCases } from "../../test-utils/typed-cases.js";
 import {
   ackDelivery,
@@ -39,15 +43,32 @@ import {
 } from "./payloads.js";
 import { runResolveOutboundTargetCoreTests } from "./targets.shared-test.js";
 
+beforeEach(() => {
+  setActivePluginRegistry(
+    createTestRegistry([{ pluginId: "discord", plugin: discordPlugin, source: "test" }]),
+  );
+});
+
 describe("delivery-queue", () => {
   let tmpDir: string;
+  let fixtureRoot = "";
+  let fixtureCount = 0;
 
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-dq-test-"));
+  beforeAll(() => {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-dq-suite-"));
   });
 
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+  beforeEach(() => {
+    tmpDir = path.join(fixtureRoot, `case-${fixtureCount++}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+  });
+
+  afterAll(() => {
+    if (!fixtureRoot) {
+      return;
+    }
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    fixtureRoot = "";
   });
 
   describe("enqueue + ack lifecycle", () => {
@@ -101,6 +122,52 @@ describe("delivery-queue", () => {
 
     it("ack is idempotent (no error on missing file)", async () => {
       await expect(ackDelivery("nonexistent-id", tmpDir)).resolves.toBeUndefined();
+    });
+
+    it("ack cleans up leftover .delivered marker when .json is already gone", async () => {
+      const id = await enqueueDelivery(
+        { channel: "whatsapp", to: "+1", payloads: [{ text: "stale-marker" }] },
+        tmpDir,
+      );
+      const queueDir = path.join(tmpDir, "delivery-queue");
+
+      fs.renameSync(path.join(queueDir, `${id}.json`), path.join(queueDir, `${id}.delivered`));
+      await expect(ackDelivery(id, tmpDir)).resolves.toBeUndefined();
+
+      expect(fs.existsSync(path.join(queueDir, `${id}.delivered`))).toBe(false);
+    });
+
+    it("ack removes .delivered marker so recovery does not replay", async () => {
+      const id = await enqueueDelivery(
+        { channel: "whatsapp", to: "+1", payloads: [{ text: "ack-test" }] },
+        tmpDir,
+      );
+      const queueDir = path.join(tmpDir, "delivery-queue");
+
+      await ackDelivery(id, tmpDir);
+
+      // Neither .json nor .delivered should remain.
+      expect(fs.existsSync(path.join(queueDir, `${id}.json`))).toBe(false);
+      expect(fs.existsSync(path.join(queueDir, `${id}.delivered`))).toBe(false);
+    });
+
+    it("loadPendingDeliveries cleans up stale .delivered markers without replaying", async () => {
+      const id = await enqueueDelivery(
+        { channel: "telegram", to: "99", payloads: [{ text: "stale" }] },
+        tmpDir,
+      );
+      const queueDir = path.join(tmpDir, "delivery-queue");
+
+      // Simulate crash between ack phase 1 (rename) and phase 2 (unlink):
+      // rename .json → .delivered, then pretend the process died.
+      fs.renameSync(path.join(queueDir, `${id}.json`), path.join(queueDir, `${id}.delivered`));
+
+      const entries = await loadPendingDeliveries(tmpDir);
+
+      // The .delivered entry must NOT appear as pending.
+      expect(entries).toHaveLength(0);
+      // And the marker file should have been cleaned up.
+      expect(fs.existsSync(path.join(queueDir, `${id}.delivered`))).toBe(false);
     });
   });
 
@@ -822,6 +889,10 @@ const discordConfig = {
 } as OpenClawConfig;
 
 describe("outbound policy", () => {
+  beforeEach(() => {
+    setDefaultChannelPluginRegistryForTests();
+  });
+
   it("allows cross-provider sends when enabled", () => {
     const cfg = {
       ...slackConfig,
@@ -864,6 +935,10 @@ describe("outbound policy", () => {
 });
 
 describe("resolveOutboundSessionRoute", () => {
+  beforeEach(() => {
+    setDefaultChannelPluginRegistryForTests();
+  });
+
   const baseConfig = {} as OpenClawConfig;
 
   it("resolves provider-specific session routes", async () => {
@@ -1063,6 +1138,60 @@ describe("resolveOutboundSessionRoute", () => {
       }
     }
   });
+
+  it("uses resolved Discord user targets to route bare numeric ids as DMs", async () => {
+    const route = await resolveOutboundSessionRoute({
+      cfg: { session: { dmScope: "per-channel-peer" } } as OpenClawConfig,
+      channel: "discord",
+      agentId: "main",
+      target: "123",
+      resolvedTarget: {
+        to: "user:123",
+        kind: "user",
+        source: "directory",
+      },
+    });
+
+    expect(route).toMatchObject({
+      sessionKey: "agent:main:discord:direct:123",
+      from: "discord:123",
+      to: "user:123",
+      chatType: "direct",
+    });
+  });
+
+  it("uses resolved Mattermost user targets to route bare ids as DMs", async () => {
+    const userId = "dthcxgoxhifn3pwh65cut3ud3w";
+    const route = await resolveOutboundSessionRoute({
+      cfg: { session: { dmScope: "per-channel-peer" } } as OpenClawConfig,
+      channel: "mattermost",
+      agentId: "main",
+      target: userId,
+      resolvedTarget: {
+        to: `user:${userId}`,
+        kind: "user",
+        source: "directory",
+      },
+    });
+
+    expect(route).toMatchObject({
+      sessionKey: `agent:main:mattermost:direct:${userId}`,
+      from: `mattermost:${userId}`,
+      to: `user:${userId}`,
+      chatType: "direct",
+    });
+  });
+
+  it("rejects bare numeric Discord targets when the caller has no kind hint", async () => {
+    await expect(
+      resolveOutboundSessionRoute({
+        cfg: { session: { dmScope: "per-channel-peer" } } as OpenClawConfig,
+        channel: "discord",
+        agentId: "main",
+        target: "123",
+      }),
+    ).rejects.toThrow(/Ambiguous Discord recipient/);
+  });
 });
 
 describe("normalizeOutboundPayloadsForJson", () => {
@@ -1145,6 +1274,16 @@ describe("normalizeOutboundPayloads", () => {
       { text: "final answer" },
     ]);
     expect(normalized).toEqual([{ text: "final answer", mediaUrls: [] }]);
+  });
+
+  it("formats BTW replies prominently for external delivery", () => {
+    const normalized = normalizeOutboundPayloads([
+      {
+        text: "323",
+        btw: { question: "what is 17 * 19?" },
+      },
+    ]);
+    expect(normalized).toEqual([{ text: "BTW\nQuestion: what is 17 * 19?\n\n323", mediaUrls: [] }]);
   });
 });
 

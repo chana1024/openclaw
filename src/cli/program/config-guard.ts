@@ -1,10 +1,6 @@
-import { loadAndMaybeMigrateDoctorConfig } from "../../commands/doctor-config-flow.js";
 import { readConfigFileSnapshot } from "../../config/config.js";
 import type { RuntimeEnv } from "../../runtime.js";
-import { colorize, isRich, theme } from "../../terminal/theme.js";
-import { shortenHomePath } from "../../utils.js";
 import { shouldMigrateStateFromPath } from "../argv.js";
-import { formatCliCommand } from "../command-format.js";
 
 const ALLOWED_INVALID_COMMANDS = new Set(["doctor", "logs", "health", "help", "status"]);
 const ALLOWED_INVALID_GATEWAY_SUBCOMMANDS = new Set([
@@ -28,10 +24,6 @@ function resetConfigGuardStateForTests() {
   configSnapshotPromise = null;
 }
 
-function formatConfigIssues(issues: Array<{ path: string; message: string }>): string[] {
-  return issues.map((issue) => `- ${issue.path || "<root>"}: ${issue.message}`);
-}
-
 async function getConfigSnapshot() {
   // Tests often mutate config fixtures; caching can make those flaky.
   if (process.env.VITEST === "true") {
@@ -50,7 +42,7 @@ export async function ensureConfigReady(params: {
   if (!didRunDoctorConfigFlow && shouldMigrateStateFromPath(commandPath)) {
     didRunDoctorConfigFlow = true;
     const runDoctorConfigFlow = async () =>
-      loadAndMaybeMigrateDoctorConfig({
+      (await import("../../commands/doctor-config-flow.js")).loadAndMaybeMigrateDoctorConfig({
         options: { nonInteractive: true },
         confirm: async () => false,
       });
@@ -83,17 +75,25 @@ export async function ensureConfigReady(params: {
         subcommandName &&
         ALLOWED_INVALID_GATEWAY_SUBCOMMANDS.has(subcommandName))
     : false;
-  const issues = snapshot.exists && !snapshot.valid ? formatConfigIssues(snapshot.issues) : [];
-  const legacyIssues =
-    snapshot.legacyIssues.length > 0
-      ? snapshot.legacyIssues.map((issue) => `- ${issue.path}: ${issue.message}`)
+  const { formatConfigIssueLines } = await import("../../config/issue-format.js");
+  const issues =
+    snapshot.exists && !snapshot.valid
+      ? formatConfigIssueLines(snapshot.issues, "-", { normalizeRoot: true })
       : [];
+  const legacyIssues =
+    snapshot.legacyIssues.length > 0 ? formatConfigIssueLines(snapshot.legacyIssues, "-") : [];
 
   const invalid = snapshot.exists && !snapshot.valid;
   if (!invalid) {
     return;
   }
 
+  const [{ colorize, isRich, theme }, { shortenHomePath }, { formatCliCommand }] =
+    await Promise.all([
+      import("../../terminal/theme.js"),
+      import("../../utils.js"),
+      import("../command-format.js"),
+    ]);
   const rich = isRich();
   const muted = (value: string) => colorize(rich, theme.muted, value);
   const error = (value: string) => colorize(rich, theme.error, value);

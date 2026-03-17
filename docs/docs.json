@@ -104,6 +104,10 @@
       "destination": "/providers/opencode"
     },
     {
+      "source": "/opencode-go",
+      "destination": "/providers/opencode-go"
+    },
+    {
       "source": "/qianfan",
       "destination": "/providers/qianfan"
     },
@@ -465,7 +469,7 @@
     },
     {
       "source": "/mac/release",
-      "destination": "/platforms/mac/release"
+      "destination": "/reference/RELEASING"
     },
     {
       "source": "/mac/remote",
@@ -872,6 +876,7 @@
                 "group": "Hosting and deployment",
                 "pages": [
                   "vps",
+                  "install/kubernetes",
                   "install/fly",
                   "install/hetzner",
                   "install/gcp",
@@ -994,6 +999,7 @@
                   "brave-search",
                   "perplexity",
                   "tools/diffs",
+                  "tools/pdf",
                   "tools/elevated",
                   "tools/exec",
                   "tools/exec-approvals",
@@ -1003,7 +1009,8 @@
                   "tools/loop-detection",
                   "tools/reactions",
                   "tools/thinking",
-                  "tools/web"
+                  "tools/web",
+                  "tools/btw"
                 ]
               },
               {
@@ -1011,7 +1018,6 @@
                 "pages": [
                   "tools/browser",
                   "tools/browser-login",
-                  "tools/chrome-extension",
                   "tools/browser-linux-troubleshooting"
                 ]
               },
@@ -1039,6 +1045,7 @@
                 "group": "Extensions",
                 "pages": [
                   "plugins/community",
+                  "plugins/bundles",
                   "plugins/voice-call",
                   "plugins/zalouser",
                   "plugins/manifest",
@@ -1110,6 +1117,7 @@
                   "providers/nvidia",
                   "providers/ollama",
                   "providers/openai",
+                  "providers/opencode-go",
                   "providers/opencode",
                   "providers/openrouter",
                   "providers/qianfan",
@@ -1158,7 +1166,6 @@
                   "platforms/mac/permissions",
                   "platforms/mac/remote",
                   "platforms/mac/signing",
-                  "platforms/mac/release",
                   "platforms/mac/bundled-gateway",
                   "platforms/mac/xpc",
                   "platforms/mac/skills",
@@ -1181,6 +1188,7 @@
                       "gateway/configuration-reference",
                       "gateway/configuration-examples",
                       "gateway/authentication",
+                      "auth-credential-semantics",
                       "gateway/secrets",
                       "gateway/secrets-plan-contract",
                       "gateway/trusted-proxy-auth",
@@ -1233,7 +1241,6 @@
                 "group": "Security",
                 "pages": [
                   "security/formal-verification",
-                  "security/README",
                   "security/THREAT-MODEL-ATLAS",
                   "security/CONTRIBUTING-THREAT-MODEL"
                 ]
@@ -1321,6 +1328,7 @@
                 "pages": [
                   "reference/wizard",
                   "reference/token-use",
+                  "reference/secretref-credential-surface",
                   "reference/prompt-caching",
                   "reference/api-usage-costs",
                   "reference/transcript-hygiene",
@@ -1342,7 +1350,7 @@
                 "pages": ["reference/credits"]
               },
               {
-                "group": "Release notes",
+                "group": "Release policy",
                 "pages": ["reference/RELEASING", "reference/test"]
               },
               {
@@ -1588,7 +1596,6 @@
                   "zh-CN/tools/apply-patch",
                   "zh-CN/brave-search",
                   "zh-CN/perplexity",
-                  "zh-CN/tools/diffs",
                   "zh-CN/tools/elevated",
                   "zh-CN/tools/exec",
                   "zh-CN/tools/exec-approvals",
@@ -1605,7 +1612,6 @@
                 "pages": [
                   "zh-CN/tools/browser",
                   "zh-CN/tools/browser-login",
-                  "zh-CN/tools/chrome-extension",
                   "zh-CN/tools/browser-linux-troubleshooting"
                 ]
               },
@@ -1742,7 +1748,6 @@
                   "zh-CN/platforms/mac/permissions",
                   "zh-CN/platforms/mac/remote",
                   "zh-CN/platforms/mac/signing",
-                  "zh-CN/platforms/mac/release",
                   "zh-CN/platforms/mac/bundled-gateway",
                   "zh-CN/platforms/mac/xpc",
                   "zh-CN/platforms/mac/skills",
@@ -1925,7 +1930,7 @@
                 "pages": ["zh-CN/reference/credits"]
               },
               {
-                "group": "发布说明",
+                "group": "发布策略",
                 "pages": ["zh-CN/reference/RELEASING", "zh-CN/reference/test"]
               },
               {

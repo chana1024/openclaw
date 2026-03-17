@@ -7,6 +7,7 @@ import { addGatewayClientOptions, callGatewayFromCli } from "../gateway-rpc.js";
 import {
   getCronChannelOptions,
   parseAt,
+  parseCronStaggerMs,
   parseDurationMs,
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
@@ -48,7 +49,10 @@ export function registerCronEditCommand(cron: Command) {
       .option("--exact", "Disable cron staggering (set stagger to 0)")
       .option("--system-event <text>", "Set systemEvent payload")
       .option("--message <text>", "Set agentTurn payload message")
-      .option("--thinking <level>", "Thinking level for agent jobs")
+      .option(
+        "--thinking <level>",
+        "Thinking level for agent jobs (off|minimal|low|medium|high|xhigh)",
+      )
       .option("--model <model>", "Model override for agent jobs")
       .option("--timeout-seconds <n>", "Timeout seconds for agent jobs")
       .option("--light-context", "Enable lightweight bootstrap context for agent jobs")
@@ -98,19 +102,7 @@ export function registerCronEditCommand(cron: Command) {
           if (staggerRaw && useExact) {
             throw new Error("Choose either --stagger or --exact, not both");
           }
-          const requestedStaggerMs = (() => {
-            if (useExact) {
-              return 0;
-            }
-            if (!staggerRaw) {
-              return undefined;
-            }
-            const parsed = parseDurationMs(staggerRaw);
-            if (!parsed) {
-              throw new Error("Invalid --stagger; use e.g. 30s, 1m, 5m");
-            }
-            return parsed;
-          })();
+          const requestedStaggerMs = parseCronStaggerMs({ staggerRaw, useExact });
 
           const patch: Record<string, unknown> = {};
           if (typeof opts.name === "string") {

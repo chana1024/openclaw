@@ -1,23 +1,9 @@
 import { requireActivePluginRegistry } from "../plugins/runtime.js";
+import { CHANNEL_IDS, CHAT_CHANNEL_ORDER, type ChatChannelId } from "./ids.js";
 import type { ChannelMeta } from "./plugins/types.js";
 import type { ChannelId } from "./plugins/types.js";
-
-// Channel docking: add new core channels here (order + meta + aliases), then
-// register the plugin in its extension entrypoint and keep protocol IDs in sync.
-export const CHAT_CHANNEL_ORDER = [
-  "telegram",
-  "whatsapp",
-  "discord",
-  "irc",
-  "googlechat",
-  "slack",
-  "signal",
-  "imessage",
-] as const;
-
-export type ChatChannelId = (typeof CHAT_CHANNEL_ORDER)[number];
-
-export const CHANNEL_IDS = [...CHAT_CHANNEL_ORDER] as const;
+export { CHANNEL_IDS, CHAT_CHANNEL_ORDER } from "./ids.js";
+export type { ChatChannelId } from "./ids.js";
 
 export type ChatChannelMeta = ChannelMeta;
 
@@ -106,6 +92,16 @@ const CHAT_CHANNEL_META: Record<ChatChannelId, ChannelMeta> = {
     docsLabel: "imessage",
     blurb: "this is still a work in progress.",
     systemImage: "message.fill",
+  },
+  line: {
+    id: "line",
+    label: "LINE",
+    selectionLabel: "LINE (Messaging API)",
+    detailLabel: "LINE Bot",
+    docsPath: "/channels/line",
+    docsLabel: "line",
+    blurb: "LINE Messaging API webhook bot.",
+    systemImage: "message",
   },
 };
 

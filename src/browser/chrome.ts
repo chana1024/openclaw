@@ -2,7 +2,9 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { SsrFPolicy } from "../infra/net/ssrf.js";
 import { ensurePortAvailable } from "../infra/ports.js";
+import { rawDataToString } from "../infra/ws.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { CONFIG_DIR } from "../utils.js";
 import {
@@ -16,7 +18,13 @@ import {
   CHROME_STOP_TIMEOUT_MS,
   CHROME_WS_READY_TIMEOUT_MS,
 } from "./cdp-timeouts.js";
-import { appendCdpPath, fetchCdpChecked, openCdpWebSocket } from "./cdp.helpers.js";
+import {
+  appendCdpPath,
+  assertCdpEndpointAllowed,
+  fetchCdpChecked,
+  isWebSocketUrl,
+  openCdpWebSocket,
+} from "./cdp.helpers.js";
 import { normalizeCdpWsUrl } from "./cdp.js";
 import {
   type BrowserExecutable,
@@ -77,12 +85,37 @@ function cdpUrlForPort(cdpPort: number) {
   return `http://127.0.0.1:${cdpPort}`;
 }
 
+async function canOpenWebSocket(url: string, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const ws = openCdpWebSocket(url, { handshakeTimeoutMs: timeoutMs });
+    ws.once("open", () => {
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      resolve(true);
+    });
+    ws.once("error", () => resolve(false));
+  });
+}
+
 export async function isChromeReachable(
   cdpUrl: string,
   timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
+  ssrfPolicy?: SsrFPolicy,
 ): Promise<boolean> {
-  const version = await fetchChromeVersion(cdpUrl, timeoutMs);
-  return Boolean(version);
+  try {
+    await assertCdpEndpointAllowed(cdpUrl, ssrfPolicy);
+    if (isWebSocketUrl(cdpUrl)) {
+      // Direct WebSocket endpoint — probe via WS handshake.
+      return await canOpenWebSocket(cdpUrl, timeoutMs);
+    }
+    const version = await fetchChromeVersion(cdpUrl, timeoutMs, ssrfPolicy);
+    return Boolean(version);
+  } catch {
+    return false;
+  }
 }
 
 type ChromeVersion = {
@@ -94,10 +127,12 @@ type ChromeVersion = {
 async function fetchChromeVersion(
   cdpUrl: string,
   timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
+  ssrfPolicy?: SsrFPolicy,
 ): Promise<ChromeVersion | null> {
   const ctrl = new AbortController();
   const t = setTimeout(ctrl.abort.bind(ctrl), timeoutMs);
   try {
+    await assertCdpEndpointAllowed(cdpUrl, ssrfPolicy);
     const versionUrl = appendCdpPath(cdpUrl, "/json/version");
     const res = await fetchCdpChecked(versionUrl, timeoutMs, { signal: ctrl.signal });
     const data = (await res.json()) as ChromeVersion;
@@ -115,8 +150,14 @@ async function fetchChromeVersion(
 export async function getChromeWebSocketUrl(
   cdpUrl: string,
   timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
+  ssrfPolicy?: SsrFPolicy,
 ): Promise<string | null> {
-  const version = await fetchChromeVersion(cdpUrl, timeoutMs);
+  await assertCdpEndpointAllowed(cdpUrl, ssrfPolicy);
+  if (isWebSocketUrl(cdpUrl)) {
+    // Direct WebSocket endpoint — the cdpUrl is already the WebSocket URL.
+    return cdpUrl;
+  }
+  const version = await fetchChromeVersion(cdpUrl, timeoutMs, ssrfPolicy);
   const wsUrl = String(version?.webSocketDebuggerUrl ?? "").trim();
   if (!wsUrl) {
     return null;
@@ -124,7 +165,7 @@ export async function getChromeWebSocketUrl(
   return normalizeCdpWsUrl(wsUrl, cdpUrl);
 }
 
-async function canOpenWebSocket(
+async function canRunCdpHealthCommand(
   wsUrl: string,
   timeoutMs = CHROME_WS_READY_TIMEOUT_MS,
 ): Promise<boolean> {
@@ -132,6 +173,37 @@ async function canOpenWebSocket(
     const ws = openCdpWebSocket(wsUrl, {
       handshakeTimeoutMs: timeoutMs,
     });
+    let settled = false;
+    const onMessage = (raw: Parameters<typeof rawDataToString>[0]) => {
+      if (settled) {
+        return;
+      }
+      let parsed: { id?: unknown; result?: unknown } | null = null;
+      try {
+        parsed = JSON.parse(rawDataToString(raw)) as { id?: unknown; result?: unknown };
+      } catch {
+        return;
+      }
+      if (parsed?.id !== 1) {
+        return;
+      }
+      finish(Boolean(parsed.result && typeof parsed.result === "object"));
+    };
+
+    const finish = (value: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      ws.off("message", onMessage);
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      resolve(value);
+    };
     const timer = setTimeout(
       () => {
         try {
@@ -139,22 +211,31 @@ async function canOpenWebSocket(
         } catch {
           // ignore
         }
-        resolve(false);
+        finish(false);
       },
       Math.max(50, timeoutMs + 25),
     );
+
     ws.once("open", () => {
-      clearTimeout(timer);
       try {
-        ws.close();
+        ws.send(
+          JSON.stringify({
+            id: 1,
+            method: "Browser.getVersion",
+          }),
+        );
       } catch {
-        // ignore
+        finish(false);
       }
-      resolve(true);
     });
+
+    ws.on("message", onMessage);
+
     ws.once("error", () => {
-      clearTimeout(timer);
-      resolve(false);
+      finish(false);
+    });
+    ws.once("close", () => {
+      finish(false);
     });
   });
 }
@@ -163,12 +244,13 @@ export async function isChromeCdpReady(
   cdpUrl: string,
   timeoutMs = CHROME_REACHABILITY_TIMEOUT_MS,
   handshakeTimeoutMs = CHROME_WS_READY_TIMEOUT_MS,
+  ssrfPolicy?: SsrFPolicy,
 ): Promise<boolean> {
-  const wsUrl = await getChromeWebSocketUrl(cdpUrl, timeoutMs);
+  const wsUrl = await getChromeWebSocketUrl(cdpUrl, timeoutMs, ssrfPolicy).catch(() => null);
   if (!wsUrl) {
     return false;
   }
-  return await canOpenWebSocket(wsUrl, handshakeTimeoutMs);
+  return await canRunCdpHealthCommand(wsUrl, handshakeTimeoutMs);
 }
 
 export async function launchOpenClawChrome(
@@ -224,9 +306,6 @@ export async function launchOpenClawChrome(
     if (process.platform === "linux") {
       args.push("--disable-dev-shm-usage");
     }
-
-    // Stealth: hide navigator.webdriver from automation detection (#80)
-    args.push("--disable-blink-features=AutomationControlled");
 
     // Append user-configured extra arguments (e.g., stealth flags, window size)
     if (resolved.extraArgs.length > 0) {
