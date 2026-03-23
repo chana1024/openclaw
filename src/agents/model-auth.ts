@@ -1,5 +1,5 @@
 import path from "node:path";
-import { type Api, getEnvApiKey, type Model } from "@mariozechner/pi-ai";
+import { type Api, type Model } from "@mariozechner/pi-ai";
 import { formatCliCommand } from "../cli/command-format.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ModelProviderAuthMode, ModelProviderConfig } from "../config/types.js";
@@ -18,14 +18,14 @@ import {
   resolveAuthProfileOrder,
   resolveAuthStorePathForDisplay,
 } from "./auth-profiles.js";
-import { PROVIDER_ENV_API_KEY_CANDIDATES } from "./model-auth-env-vars.js";
+import { resolveEnvApiKey, type EnvApiKeyResult } from "./model-auth-env.js";
 import {
   CUSTOM_LOCAL_AUTH_MARKER,
   isKnownEnvApiKeyMarker,
   isNonSecretApiKeyMarker,
   OLLAMA_LOCAL_AUTH_MARKER,
 } from "./model-auth-markers.js";
-import { normalizeProviderId, normalizeProviderIdForAuth } from "./model-selection.js";
+import { normalizeProviderId } from "./model-selection.js";
 
 export { ensureAuthProfileStore, resolveAuthProfileOrder } from "./auth-profiles.js";
 
@@ -394,108 +394,10 @@ export async function resolveApiKeyForProvider(params: {
   );
 }
 
-export type EnvApiKeyResult = { apiKey: string; source: string };
 export type ModelAuthMode = "api-key" | "oauth" | "token" | "mixed" | "aws-sdk" | "unknown";
 
-export function resolveEnvApiKey(
-  provider: string,
-  env: NodeJS.ProcessEnv = process.env,
-): EnvApiKeyResult | null {
-  const normalized = normalizeProviderIdForAuth(provider);
-  const applied = new Set(getShellEnvAppliedKeys());
-  const pick = (envVar: string): EnvApiKeyResult | null => {
-    const value = normalizeOptionalSecretInput(env[envVar]);
-    if (!value) {
-      return null;
-    }
-    const source = applied.has(envVar) ? `shell env: ${envVar}` : `env: ${envVar}`;
-    return { apiKey: value, source };
-  };
-
-  const candidates = PROVIDER_ENV_API_KEY_CANDIDATES[normalized];
-  if (candidates) {
-    for (const envVar of candidates) {
-      const resolved = pick(envVar);
-      if (resolved) {
-        return resolved;
-      }
-    }
-  }
-
-  if (normalized === "google-vertex") {
-    const envKey = getEnvApiKey(normalized);
-    if (!envKey) {
-      return null;
-    }
-    return { apiKey: envKey, source: "gcloud adc" };
-  }
-
-  if (normalized === "opencode") {
-    return pick("OPENCODE_API_KEY") ?? pick("OPENCODE_ZEN_API_KEY");
-  }
-
-  if (normalized === "qwen-portal") {
-    return pick("QWEN_OAUTH_TOKEN") ?? pick("QWEN_PORTAL_API_KEY");
-  }
-
-  if (normalized === "volcengine" || normalized === "volcengine-plan") {
-    return pick("VOLCANO_ENGINE_API_KEY");
-  }
-
-  if (normalized === "byteplus" || normalized === "byteplus-plan") {
-    return pick("BYTEPLUS_API_KEY");
-  }
-  if (normalized === "minimax-portal") {
-    return pick("MINIMAX_OAUTH_TOKEN") ?? pick("MINIMAX_API_KEY");
-  }
-
-  if (normalized === "kimi-coding") {
-    return pick("KIMI_API_KEY") ?? pick("KIMICODE_API_KEY");
-  }
-
-  if (normalized === "huggingface") {
-    return pick("HUGGINGFACE_HUB_TOKEN") ?? pick("HF_TOKEN");
-  }
-
-  const envMap: Record<string, string> = {
-    openai: "OPENAI_API_KEY",
-    google: "GEMINI_API_KEY",
-    voyage: "VOYAGE_API_KEY",
-    groq: "GROQ_API_KEY",
-    deepgram: "DEEPGRAM_API_KEY",
-    cerebras: "CEREBRAS_API_KEY",
-    xai: "XAI_API_KEY",
-    openrouter: "OPENROUTER_API_KEY",
-    litellm: "LITELLM_API_KEY",
-    "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
-    "cloudflare-ai-gateway": "CLOUDFLARE_AI_GATEWAY_API_KEY",
-    moonshot: "MOONSHOT_API_KEY",
-    minimax: "MINIMAX_API_KEY",
-    nvidia: "NVIDIA_API_KEY",
-    xiaomi: "XIAOMI_API_KEY",
-    synthetic: "SYNTHETIC_API_KEY",
-    venice: "VENICE_API_KEY",
-    mistral: "MISTRAL_API_KEY",
-    opencode: "OPENCODE_API_KEY",
-    together: "TOGETHER_API_KEY",
-    qianfan: "QIANFAN_API_KEY",
-    ollama: "OLLAMA_API_KEY",
-    vllm: "VLLM_API_KEY",
-    kilocode: "KILOCODE_API_KEY",
-  };
-  const envVar = envMap[normalized];
-  if (!envVar) {
-    return null;
-  }
-  return pick(envVar);
-}
-
-export function shouldSetRuntimeApiKey(provider: string, apiKey: string): boolean {
-  return !(
-    normalizeProviderId(provider) === "google-vertex" &&
-    apiKey === GOOGLE_VERTEX_ADC_PLACEHOLDER_API_KEY
-  );
-}
+export { resolveEnvApiKey } from "./model-auth-env.js";
+export type { EnvApiKeyResult } from "./model-auth-env.js";
 
 export function resolveModelAuthMode(
   provider?: string,

@@ -508,37 +508,54 @@ describe("getApiKeyForModel", () => {
     );
   });
 
-  it("resolveEnvApiKey('google-vertex') returns ADC placeholder when project, location, and credentials are set", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-google-vertex-"));
-    const credentialsPath = path.join(tempDir, "application_default_credentials.json");
+  it("resolveEnvApiKey('anthropic-vertex') uses the provided env snapshot", async () => {
+    const resolved = resolveEnvApiKey("anthropic-vertex", {
+      GOOGLE_CLOUD_PROJECT_ID: "vertex-project",
+    } as NodeJS.ProcessEnv);
+
+    expect(resolved).toBeNull();
+  });
+
+  it("resolveEnvApiKey('anthropic-vertex') accepts GOOGLE_APPLICATION_CREDENTIALS with project_id", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-adc-"));
+    const credentialsPath = path.join(tempDir, "adc.json");
+    await fs.writeFile(credentialsPath, JSON.stringify({ project_id: "vertex-project" }), "utf8");
 
     try {
-      await fs.writeFile(credentialsPath, '{"type":"authorized_user"}\n', "utf8");
+      const resolved = resolveEnvApiKey("anthropic-vertex", {
+        GOOGLE_APPLICATION_CREDENTIALS: credentialsPath,
+      } as NodeJS.ProcessEnv);
 
-      await withEnvAsync(
-        {
-          GOOGLE_APPLICATION_CREDENTIALS: credentialsPath,
-          GOOGLE_CLOUD_PROJECT: "test-project",
-          GOOGLE_CLOUD_LOCATION: "global",
-        },
-        async () => {
-          const resolved = resolveEnvApiKey("google-vertex");
-          expect(resolved).toEqual({
-            apiKey: GOOGLE_VERTEX_ADC_PLACEHOLDER_API_KEY,
-            source: "gcloud adc",
-          });
-        },
-      );
+      expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
+      expect(resolved?.source).toBe("gcloud adc");
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 
-  it("does not apply runtime api keys for google-vertex ADC placeholders", () => {
-    expect(shouldSetRuntimeApiKey("google-vertex", GOOGLE_VERTEX_ADC_PLACEHOLDER_API_KEY)).toBe(
-      false,
-    );
-    expect(shouldSetRuntimeApiKey("google", GOOGLE_VERTEX_ADC_PLACEHOLDER_API_KEY)).toBe(true);
-    expect(shouldSetRuntimeApiKey("google-vertex", "real-key")).toBe(true);
+  it("resolveEnvApiKey('anthropic-vertex') accepts GOOGLE_APPLICATION_CREDENTIALS without a local project field", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-adc-"));
+    const credentialsPath = path.join(tempDir, "adc.json");
+    await fs.writeFile(credentialsPath, "{}", "utf8");
+
+    try {
+      const resolved = resolveEnvApiKey("anthropic-vertex", {
+        GOOGLE_APPLICATION_CREDENTIALS: credentialsPath,
+      } as NodeJS.ProcessEnv);
+
+      expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
+      expect(resolved?.source).toBe("gcloud adc");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveEnvApiKey('anthropic-vertex') accepts explicit metadata auth opt-in", async () => {
+    const resolved = resolveEnvApiKey("anthropic-vertex", {
+      ANTHROPIC_VERTEX_USE_GCP_METADATA: "true",
+    } as NodeJS.ProcessEnv);
+
+    expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
+    expect(resolved?.source).toBe("gcloud adc");
   });
 });
