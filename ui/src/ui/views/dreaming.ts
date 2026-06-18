@@ -1,6 +1,7 @@
 import { html, nothing } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { t } from "../../i18n/index.ts";
+import type { MemoryWikiStatus } from "../../../extensions/memory-wiki/src/status.ts";
 import type {
   DreamingEntry,
   WikiImportInsights,
@@ -124,12 +125,26 @@ export type DreamingProps = {
   wikiMemoryPalaceLoading: boolean;
   wikiMemoryPalaceError: string | null;
   wikiMemoryPalace: WikiMemoryPalace | null;
+  wikiStatusLoading: boolean;
+  wikiStatusError: string | null;
+  wikiStatus: MemoryWikiStatus | null;
+  wikiCompileLoading: boolean;
+  wikiCompileError: string | null;
   onRefresh: () => void;
   onRefreshDiary: () => void;
   onRefreshImports: () => void;
   onRefreshMemoryPalace: () => void;
+  onRefreshWikiStatus: () => void;
+  onCompileWiki: () => void;
   onOpenConfig: () => void;
-  onOpenWikiPage: (lookup: string) => Promise<{
+  onOpenWikiPage: (request:
+    | string
+    | {
+        lookup: string;
+        startLine?: number;
+        endLine?: number;
+        highlightQuery?: string;
+      }) => Promise<{
     title: string;
     path: string;
     content: string;
@@ -195,6 +210,9 @@ let _wikiPreviewContent = "";
 let _wikiPreviewTotalLines: number | null = null;
 let _wikiPreviewTruncated = false;
 let _wikiPreviewError: string | null = null;
+let _wikiPreviewHighlightQuery: string | null = null;
+let _wikiPreviewStartLine: number | null = null;
+let _wikiPreviewEndLine: number | null = null;
 
 export function setDreamSubTab(tab: DreamSubTab): void {
   _subTab = tab;
@@ -326,6 +344,7 @@ export function renderDreaming(props: DreamingProps) {
         : _subTab === "diary"
           ? renderDiarySection(props)
           : renderAdvancedSection(props)}
+      ${renderWikiPreviewOverlay(props)}
     </div>
   `;
 }
@@ -460,6 +479,103 @@ function formatRange(path: string, startLine: number, endLine: number): string {
   return startLine === endLine ? `${path}:${startLine}` : `${path}:${startLine}-${endLine}`;
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightText(value: string, query?: string | null): string {
+  const escaped = escapeHtml(value);
+  if (!query?.trim()) {
+    return escaped;
+  }
+  const pattern = new RegExp(`(${escapeRegExp(query.trim())})`, "gi");
+  return escaped.replace(pattern, "<mark>$1</mark>");
+}
+
+function renderHighlightedText(value: string, query?: string | null) {
+  return unsafeHTML(highlightText(value, query));
+}
+
+function renderWikiPreviewContent() {
+  const lines = _wikiPreviewContent.split("\n");
+  const hasTargetRange =
+    typeof _wikiPreviewStartLine === "number" && typeof _wikiPreviewEndLine === "number";
+  const htmlContent = lines
+    .map((line, index) => {
+      const lineNumber = index + 1;
+      const inTargetRange =
+        hasTargetRange && lineNumber >= (_wikiPreviewStartLine ?? 0) && lineNumber <= (_wikiPreviewEndLine ?? 0);
+      const attrs = inTargetRange ? ' data-wiki-preview-target="true"' : "";
+      const classes = inTargetRange
+        ? "dreams-diary__overlay-line dreams-diary__overlay-line--target"
+        : "dreams-diary__overlay-line";
+      return `<span class="${classes}"${attrs}>${highlightText(line, _wikiPreviewHighlightQuery)}</span>`;
+    })
+    .join("\n");
+  queueMicrotask(() => {
+    const target = document.querySelector("[data-wiki-preview-target='true']") as HTMLElement | null;
+    target?.scrollIntoView({ block: "center" });
+  });
+  return unsafeHTML(htmlContent);
+}
+
+function summarizeWikiStatus(status: MemoryWikiStatus | null): string[] {
+  if (!status) {
+    return [];
+  }
+  const parts: string[] = [];
+  const totalPages = Object.values(status.pageCounts).reduce((sum, count) => sum + count, 0);
+  if (!status.vaultExists) {
+    parts.push("Wiki vault missing");
+  }
+  parts.push(`${totalPages} pages indexed`);
+  if (status.warnings.length > 0) {
+    parts.push(`${status.warnings.length} warning${status.warnings.length === 1 ? "" : "s"}`);
+  }
+  return parts;
+}
+
+function renderWikiStatusSummary(props: DreamingProps) {
+  const parts = summarizeWikiStatus(props.wikiStatus);
+  if (props.wikiStatusError) {
+    parts.push(props.wikiStatusError);
+  }
+  if (parts.length === 0 && !props.wikiStatusLoading && !props.wikiCompileError) {
+    return nothing;
+  }
+  return html`
+    <div class="dreams-diary__empty-hint">
+      ${parts.length > 0 ? parts.join(" · ") : "Checking wiki status…"}
+      ${props.wikiCompileError ? html` · ${props.wikiCompileError}` : nothing}
+    </div>
+    <div class="dreams-diary__insight-actions">
+      <button
+        class="btn btn--subtle btn--sm"
+        ?disabled=${props.wikiStatusLoading}
+        @click=${() => props.onRefreshWikiStatus()}
+      >
+        ${props.wikiStatusLoading ? "Refreshing status…" : "Refresh status"}
+      </button>
+      <button
+        class="btn btn--subtle btn--sm"
+        ?disabled=${props.wikiCompileLoading}
+        @click=${() => props.onCompileWiki()}
+      >
+        ${props.wikiCompileLoading ? "Building index…" : "Build index"}
+      </button>
+    </div>
+  `;
+}
+
 function formatCompactDateTime(value: string): string {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) {
@@ -523,7 +639,18 @@ function toggleExpandedCard(bucket: Set<string>, key: string, requestUpdate?: ()
   requestUpdate?.();
 }
 
-async function openWikiPreview(lookup: string, props: DreamingProps): Promise<void> {
+async function openWikiPreview(
+  request:
+    | string
+    | {
+        lookup: string;
+        startLine?: number;
+        endLine?: number;
+        highlightQuery?: string;
+      },
+  props: DreamingProps,
+): Promise<void> {
+  const lookup = typeof request === "string" ? request : request.lookup;
   _wikiPreviewOpen = true;
   _wikiPreviewLoading = true;
   _wikiPreviewTitle = basename(lookup);
@@ -533,9 +660,12 @@ async function openWikiPreview(lookup: string, props: DreamingProps): Promise<vo
   _wikiPreviewTotalLines = null;
   _wikiPreviewTruncated = false;
   _wikiPreviewError = null;
+  _wikiPreviewHighlightQuery = typeof request === "string" ? null : request.highlightQuery ?? null;
+  _wikiPreviewStartLine = typeof request === "string" ? null : request.startLine ?? null;
+  _wikiPreviewEndLine = typeof request === "string" ? null : request.endLine ?? null;
   props.onRequestUpdate?.();
   try {
-    const preview = await props.onOpenWikiPage(lookup);
+    const preview = await props.onOpenWikiPage(request);
     if (!preview) {
       _wikiPreviewError = `No wiki page found for ${lookup}.`;
       return;
@@ -573,10 +703,13 @@ function renderWikiPreviewOverlay(props: DreamingProps) {
   }
   return html`
     <div
-      class="dreams-diary__preview-backdrop"
+      class="dreams-diary__preview-backdrop dreams-diary__overlay-backdrop"
       @click=${() => closeWikiPreview(props.onRequestUpdate)}
     >
-      <div class="dreams-diary__preview-panel" @click=${(event: Event) => event.stopPropagation()}>
+      <div
+        class="dreams-diary__preview-panel dreams-diary__overlay-card"
+        @click=${(event: Event) => event.stopPropagation()}
+      >
         <div class="dreams-diary__preview-header">
           <div>
             <div class="dreams-diary__preview-title">${_wikiPreviewTitle || "Wiki page"}</div>
@@ -607,7 +740,7 @@ function renderWikiPreviewOverlay(props: DreamingProps) {
                         </div>
                       `
                     : nothing}
-                  <pre class="dreams-diary__preview-pre">${_wikiPreviewContent}</pre>
+                  <pre class="dreams-diary__preview-pre">${renderWikiPreviewContent()}</pre>
                 `}
         </div>
       </div>
@@ -693,6 +826,7 @@ function describeWaitingEntryOrigin(entry: DreamingEntry): string {
 }
 
 function renderAdvancedEntryList(params: {
+  props: DreamingProps;
   titleKey: string;
   descriptionKey: string;
   emptyKey: string;
@@ -720,6 +854,7 @@ function renderAdvancedEntryList(params: {
               ${params.entries.map(
                 (entry) => html`
                   <article class="dreams-advanced__item" data-entry-key=${entry.key}>
+                    <div class="dreams-advanced__path">${entry.path}</div>
                     ${params.badge
                       ? (() => {
                           const label = params.badge?.(entry);
@@ -728,7 +863,7 @@ function renderAdvancedEntryList(params: {
                             : nothing;
                         })()
                       : nothing}
-                    <div class="dreams-advanced__snippet">${entry.snippet}</div>
+                    <div class="dreams-advanced__snippet">${renderHighlightedText(entry.snippet, entry.query)}</div>
                     <div class="dreams-advanced__source">
                       ${formatRange(entry.path, entry.startLine, entry.endLine)}
                     </div>
@@ -737,6 +872,23 @@ function renderAdvancedEntryList(params: {
                         .meta(entry)
                         .filter((part) => part.length > 0)
                         .join(" · ")}
+                    </div>
+                    <div class="dreams-diary__insight-actions">
+                      <button
+                        class="btn btn--subtle btn--sm"
+                        @click=${() =>
+                          void openWikiPreview(
+                            {
+                              lookup: entry.path,
+                              startLine: entry.startLine,
+                              endLine: entry.endLine,
+                              highlightQuery: entry.query,
+                            },
+                            params.props,
+                          )}
+                      >
+                        Open preview
+                      </button>
                     </div>
                   </article>
                 `,
@@ -836,6 +988,7 @@ function renderAdvancedSection(props: DreamingProps) {
 
       <div class="dreams-advanced__sections">
         ${renderAdvancedEntryList({
+          props,
           titleKey: "dreaming.advanced.stagedTitle",
           descriptionKey: "dreaming.advanced.stagedDescription",
           emptyKey: "dreaming.advanced.emptyGrounded",
@@ -859,6 +1012,7 @@ function renderAdvancedSection(props: DreamingProps) {
           ],
         })}
         ${renderAdvancedEntryList({
+          props,
           titleKey: "dreaming.advanced.shortTermTitle",
           descriptionKey: "dreaming.advanced.shortTermDescription",
           emptyKey: "dreaming.advanced.emptyShortTerm",
@@ -901,6 +1055,7 @@ function renderAdvancedSection(props: DreamingProps) {
           ],
         })}
         ${renderAdvancedEntryList({
+          props,
           titleKey: "dreaming.advanced.promotedTitle",
           descriptionKey: "dreaming.advanced.promotedDescription",
           emptyKey: "dreaming.advanced.emptyPromoted",
@@ -1113,6 +1268,7 @@ function renderDiaryImportsSection(props: DreamingProps) {
 function renderMemoryPalaceSection(props: DreamingProps) {
   const palace = props.wikiMemoryPalace;
   const clusters = palace?.clusters ?? [];
+  const statusSummary = renderWikiStatusSummary(props);
 
   if (props.wikiMemoryPalaceLoading && clusters.length === 0) {
     return html`
@@ -1140,6 +1296,7 @@ function renderMemoryPalaceSection(props: DreamingProps) {
 
   return html`
     <div class="dreams-diary__daychips">
+      ${statusSummary}
       ${clusters.map(
         (entry, index) => html`
           <button
@@ -1466,7 +1623,6 @@ function renderDiarySection(props: DreamingProps) {
           : _diarySubTab === "insights"
             ? renderDiaryImportsSection(props)
             : renderMemoryPalaceSection(props)}
-      ${renderWikiPreviewOverlay(props)}
     </section>
   `;
 }

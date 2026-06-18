@@ -451,7 +451,65 @@ async function processResponsesStream(
 ) {
   let currentItem: Record<string, unknown> | null = null;
   let currentBlock: Record<string, unknown> | null = null;
-  const blockIndex = () => output.content.length - 1;
+  let currentBlockIndex = -1;
+  const blockIndex = () => currentBlockIndex;
+
+  const finalizeTextBlock = (item?: Record<string, unknown>) => {
+    if (currentItem?.type !== "message" || currentBlock?.type !== "text") {
+      return false;
+    }
+    if (item) {
+      const content = Array.isArray(item.content) ? item.content : [];
+      const finalizedText = content
+        .map((part) => {
+          const contentPart = part as { type?: string; text?: string; refusal?: string };
+          return contentPart.type === "output_text"
+            ? (contentPart.text ?? "")
+            : (contentPart.refusal ?? "");
+        })
+        .join("");
+      if (finalizedText) {
+        currentBlock.text = finalizedText;
+      }
+      currentBlock.textSignature = encodeTextSignatureV1(
+        stringifyUnknown(item.id),
+        (item.phase as "commentary" | "final_answer" | undefined) ?? undefined,
+      );
+    }
+    stream.push({
+      type: "text_end",
+      contentIndex: blockIndex(),
+      content: stringifyUnknown(currentBlock.text),
+      partial: output,
+    });
+    currentBlock = null;
+    return true;
+  };
+
+  const finalizeToolCallBlock = (item?: Record<string, unknown>, explicitArguments?: unknown) => {
+    if (currentItem?.type !== "function_call") {
+      return false;
+    }
+    const args =
+      explicitArguments !== undefined
+        ? parseStreamingJson(stringifyJsonLike(explicitArguments, "{}"))
+        : currentBlock?.type === "toolCall" && currentBlock.partialJson
+          ? parseStreamingJson(stringifyJsonLike(currentBlock.partialJson, "{}"))
+          : parseStreamingJson(stringifyJsonLike(item?.arguments, "{}"));
+    stream.push({
+      type: "toolcall_end",
+      contentIndex: blockIndex(),
+      toolCall: {
+        type: "toolCall",
+        id: `${stringifyUnknown(item?.call_id ?? currentItem.call_id)}|${stringifyUnknown(item?.id ?? currentItem.id)}`,
+        name: stringifyUnknown(item?.name ?? currentItem.name),
+        arguments: args,
+      },
+      partial: output,
+    });
+    currentBlock = null;
+    return true;
+  };
   for await (const rawEvent of openaiStream) {
     const event = rawEvent as Record<string, unknown>;
     const type = stringifyUnknown(event.type);
@@ -462,12 +520,12 @@ async function processResponsesStream(
       if (item.type === "reasoning") {
         currentItem = item;
         currentBlock = { type: "thinking", thinking: "" };
-        output.content.push(currentBlock);
+        currentBlockIndex = output.content.push(currentBlock) - 1;
         stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
       } else if (item.type === "message") {
         currentItem = item;
         currentBlock = { type: "text", text: "" };
-        output.content.push(currentBlock);
+        currentBlockIndex = output.content.push(currentBlock) - 1;
         stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
       } else if (item.type === "function_call") {
         currentItem = item;
@@ -478,7 +536,7 @@ async function processResponsesStream(
           arguments: {},
           partialJson: stringifyJsonLike(item.arguments),
         };
-        output.content.push(currentBlock);
+        currentBlockIndex = output.content.push(currentBlock) - 1;
         stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
       }
     } else if (type === "response.reasoning_summary_text.delta") {
@@ -512,6 +570,33 @@ async function processResponsesStream(
           partial: output,
         });
       }
+    } else if (type === "response.output_text.done") {
+      if (currentItem?.type === "message" && currentBlock?.type === "text") {
+        const finalText = stringifyUnknown(event.text);
+        if (finalText) {
+          currentBlock.text = finalText;
+        }
+        finalizeTextBlock();
+      }
+    } else if (type === "response.content_part.done") {
+      if (currentItem?.type === "message" && currentBlock?.type === "text") {
+        const part = event.part as { type?: string; text?: string; refusal?: string } | undefined;
+        if (part?.type === "output_text" && typeof part.text === "string") {
+          currentBlock.text = part.text;
+        } else if (part?.type === "refusal" && typeof part.refusal === "string") {
+          currentBlock.text = part.refusal;
+        }
+      }
+    } else if (type === "response.function_call_arguments.done") {
+      if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
+        const finalArguments = event.arguments;
+        currentBlock.partialJson = stringifyJsonLike(
+          finalArguments,
+          stringifyJsonLike(currentBlock.partialJson),
+        );
+        currentBlock.arguments = parseStreamingJson(stringifyJsonLike(currentBlock.partialJson, "{}"));
+        finalizeToolCallBlock(currentItem, finalArguments);
+      }
     } else if (type === "response.output_item.done") {
       const item = event.item as Record<string, unknown>;
       if (item.type === "reasoning" && currentBlock?.type === "thinking") {
@@ -532,44 +617,10 @@ async function processResponsesStream(
           partial: output,
         });
         currentBlock = null;
-      } else if (item.type === "message" && currentBlock?.type === "text") {
-        const content = Array.isArray(item.content) ? item.content : [];
-        currentBlock.text = content
-          .map((part) => {
-            const contentPart = part as { type?: string; text?: string; refusal?: string };
-            return contentPart.type === "output_text"
-              ? (contentPart.text ?? "")
-              : (contentPart.refusal ?? "");
-          })
-          .join("");
-        currentBlock.textSignature = encodeTextSignatureV1(
-          stringifyUnknown(item.id),
-          (item.phase as "commentary" | "final_answer" | undefined) ?? undefined,
-        );
-        stream.push({
-          type: "text_end",
-          contentIndex: blockIndex(),
-          content: stringifyUnknown(currentBlock.text),
-          partial: output,
-        });
-        currentBlock = null;
+      } else if (item.type === "message") {
+        finalizeTextBlock(item);
       } else if (item.type === "function_call") {
-        const args =
-          currentBlock?.type === "toolCall" && currentBlock.partialJson
-            ? parseStreamingJson(stringifyJsonLike(currentBlock.partialJson, "{}"))
-            : parseStreamingJson(stringifyJsonLike(item.arguments, "{}"));
-        stream.push({
-          type: "toolcall_end",
-          contentIndex: blockIndex(),
-          toolCall: {
-            type: "toolCall",
-            id: `${stringifyUnknown(item.call_id)}|${stringifyUnknown(item.id)}`,
-            name: stringifyUnknown(item.name),
-            arguments: args,
-          },
-          partial: output,
-        });
-        currentBlock = null;
+        finalizeToolCallBlock(item);
       }
     } else if (type === "response.completed") {
       const response = event.response as Record<string, unknown> | undefined;
@@ -2009,4 +2060,5 @@ export const __testing = {
   sanitizeOpenAICodexResponsesParams,
   buildOpenAICompletionsClientConfig,
   processOpenAICompletionsStream,
+  processResponsesStream,
 };

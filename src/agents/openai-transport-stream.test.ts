@@ -4488,4 +4488,165 @@ describe("openai transport stream", () => {
       __testing.processOpenAICompletionsStream(mockStream(), output, model, stream),
     ).rejects.toThrow("Exceeded tool-call argument buffer limit");
   });
+
+  it("finalizes HTTP responses text blocks from granular done events without waiting for output_item.done", async () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-responses",
+      provider: "custom-openai-responses",
+      baseUrl: "http://127.0.0.1:3000/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-responses">;
+
+    const output = {
+      role: "assistant" as const,
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    const events: unknown[] = [];
+    const stream = { push(event: unknown) { events.push(event); } };
+    const mockChunks = [
+      { type: "response.created", response: { id: "resp_1" } },
+      {
+        type: "response.output_item.added",
+        item: { id: "msg_1", type: "message", role: "assistant" },
+      },
+      { type: "response.output_text.delta", item_id: "msg_1", delta: "hel" },
+      {
+        type: "response.content_part.done",
+        item_id: "msg_1",
+        part: { type: "output_text", text: "hello" },
+      },
+      { type: "response.output_text.done", item_id: "msg_1", text: "hello" },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_1",
+          status: "completed",
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        },
+      },
+    ] as const;
+
+    async function* mockStream() {
+      for (const chunk of mockChunks) {
+        yield chunk as never;
+      }
+    }
+
+    await __testing.processResponsesStream(mockStream(), output, stream, model);
+
+    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
+      "text_start",
+      "text_delta",
+      "text_end",
+    ]);
+    expect(output.content).toMatchObject([{ type: "text", text: "hello" }]);
+    expect(output.responseId).toBe("resp_1");
+    expect(output.stopReason).toBe("stop");
+  });
+
+  it("finalizes HTTP responses tool calls from function_call_arguments.done without waiting for output_item.done", async () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-responses",
+      provider: "custom-openai-responses",
+      baseUrl: "http://127.0.0.1:3000/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-responses">;
+
+    const output = {
+      role: "assistant" as const,
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    const events: unknown[] = [];
+    const stream = { push(event: unknown) { events.push(event); } };
+    const mockChunks = [
+      { type: "response.created", response: { id: "resp_tool_1" } },
+      {
+        type: "response.output_item.added",
+        item: {
+          id: "fc_item_1",
+          call_id: "call_1",
+          type: "function_call",
+          name: "lookup_weather",
+          arguments: "",
+        },
+      },
+      { type: "response.function_call_arguments.delta", item_id: "fc_item_1", delta: '{"city":"' },
+      {
+        type: "response.function_call_arguments.done",
+        item_id: "fc_item_1",
+        arguments: '{"city":"Paris"}',
+      },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_tool_1",
+          status: "completed",
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        },
+      },
+    ] as const;
+
+    async function* mockStream() {
+      for (const chunk of mockChunks) {
+        yield chunk as never;
+      }
+    }
+
+    await __testing.processResponsesStream(mockStream(), output, stream, model);
+
+    expect(events.map((event) => (event as { type?: string }).type)).toEqual([
+      "toolcall_start",
+      "toolcall_delta",
+      "toolcall_end",
+    ]);
+    expect(output.content).toMatchObject([
+      {
+        type: "toolCall",
+        id: "call_1|fc_item_1",
+        name: "lookup_weather",
+        arguments: { city: "Paris" },
+      },
+    ]);
+    expect(output.stopReason).toBe("toolUse");
+  });
 });

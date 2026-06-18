@@ -49,6 +49,7 @@ export type DreamingEntry = {
   phaseHitCount: number;
   promotedAt?: string;
   lastRecalledAt?: string;
+  query?: string;
 };
 
 export type DreamingStatus = {

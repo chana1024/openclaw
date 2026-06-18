@@ -159,6 +159,12 @@ Telegraph style. Root rules only. Read scoped `AGENTS.md` before subtree work.
 - Commit via `scripts/committer "<msg>" <file...>`; stage intended files only. It formats staged files; still run gates.
 - Commits: conventional-ish, concise, grouped.
 - No manual stash/autostash unless explicit. No branch/worktree changes unless requested.
+- Local checkout note: `/home/lzn/.nvm/versions/node/v24.13.0/bin/openclaw` is a symlinked global install to this repo's `openclaw.mjs`; updating this checkout changes the CLI that runs as `openclaw`.
+- Local remotes: `origin` is the user fork `https://github.com/chana1024/openclaw.git`; `upstream` is official `https://github.com/openclaw/openclaw.git`.
+- Local branch note: `main-upstream` tracks `origin/main-upstream`, but upgrades should normally merge from `upstream/main`.
+- Upgrade fetch note: this repo has thousands of upstream branches, so prefer `git fetch upstream main:refs/remotes/upstream/main` over broad `git fetch --all` when refreshing latest upstream main.
+- Upgrade safety: before merging upstream, record `git status --short`, create a backup branch, and save any local dirty diff to `/tmp/openclaw-local-before-upgrade-<date>.patch`; do not directly overwrite local edits.
+- Upgrade workflow: temporarily reverse-apply the saved local patch, merge `upstream/main`, then reapply the patch with `git apply --3way`. If version files stay stale after a merge, compare with `upstream/main` and restore version-related files from upstream rather than hand-editing guessed values.
 - `main`: no merge commits; rebase on latest `origin/main` before push. Do not
   keep chasing `main` with repeated full gates after one green run plus a clean
   rebase sanity pass.

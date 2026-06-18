@@ -2,6 +2,7 @@
 
 import { render } from "lit";
 import { describe, expect, it, vi } from "vitest";
+import type { MemoryWikiStatus } from "../../../extensions/memory-wiki/src/status.ts";
 import {
   renderDreaming,
   setDreamAdvancedWaitingSort,
@@ -175,10 +176,17 @@ function buildProps(overrides?: Partial<DreamingProps>): DreamingProps {
         },
       ],
     },
+    wikiStatusLoading: false,
+    wikiStatusError: null,
+    wikiStatus: buildWikiStatus(),
+    wikiCompileLoading: false,
+    wikiCompileError: null,
     onRefresh: () => {},
     onRefreshDiary: () => {},
     onRefreshImports: () => {},
     onRefreshMemoryPalace: () => {},
+    onRefreshWikiStatus: () => {},
+    onCompileWiki: () => {},
     onOpenConfig: () => {},
     onOpenWikiPage: async () => null,
     onBackfillDiary: () => {},
@@ -193,8 +201,54 @@ function buildProps(overrides?: Partial<DreamingProps>): DreamingProps {
 
 function renderInto(props: DreamingProps): HTMLDivElement {
   const container = document.createElement("div");
-  render(renderDreaming(props), container);
+  document.body.appendChild(container);
+  const effectiveProps = {
+    ...props,
+    onRequestUpdate: props.onRequestUpdate ?? (() => render(renderDreaming(effectiveProps), container)),
+  } satisfies DreamingProps;
+  render(renderDreaming(effectiveProps), container);
   return container;
+}
+
+function buildWikiStatus(overrides?: Partial<MemoryWikiStatus>): MemoryWikiStatus {
+  return {
+    vaultMode: "bridge",
+    renderMode: "markdown",
+    vaultPath: "/vault/wiki",
+    vaultExists: true,
+    bridge: {
+      enabled: true,
+      readMemoryArtifacts: true,
+      artifactIds: [],
+    },
+    bridgePublicArtifactCount: 3,
+    obsidianCli: {
+      enabled: false,
+      requested: false,
+      available: false,
+      command: null,
+    },
+    unsafeLocal: {
+      allowPrivateMemoryCoreAccess: false,
+      pathCount: 0,
+    },
+    pageCounts: {
+      source: 12,
+      entity: 5,
+      concept: 4,
+      synthesis: 2,
+      report: 1,
+    },
+    sourceCounts: {
+      native: 7,
+      bridge: 3,
+      bridgeEvents: 1,
+      unsafeLocal: 0,
+      other: 1,
+    },
+    warnings: [],
+    ...overrides,
+  };
 }
 
 describe("dreaming view", () => {
@@ -542,6 +596,148 @@ describe("dreaming view", () => {
     );
     expect(container.textContent).not.toContain("Signal Hotspots");
     setDreamAdvancedWaitingSort("recent");
+    setDreamSubTab("scene");
+  });
+
+  it("shows wiki status and compile actions in the diary header", () => {
+    setDreamSubTab("diary");
+    setDreamDiarySubTab("palace");
+    const onRefreshWikiStatus = vi.fn();
+    const onCompileWiki = vi.fn();
+    const container = renderInto(
+      buildProps({
+        wikiStatus: buildWikiStatus({
+          vaultExists: false,
+          pageCounts: { source: 0, entity: 0, concept: 0, synthesis: 0, report: 0 },
+          warnings: [{ code: "vault-missing", message: "Wiki vault has not been initialized yet." }],
+        }),
+        onRefreshWikiStatus,
+        onCompileWiki,
+      }),
+    );
+
+    expect(container.textContent).toContain("Wiki vault missing");
+    expect(container.textContent).toContain("0 pages indexed");
+    expect(container.textContent).toContain("1 warning");
+
+    const statusButton = [...container.querySelectorAll("button")].find(
+      (node) => node.textContent?.trim() === "Refresh status",
+    );
+    const compileButton = [...container.querySelectorAll("button")].find(
+      (node) => node.textContent?.trim() === "Build index",
+    );
+    expect(statusButton).not.toBeUndefined();
+    expect(compileButton).not.toBeUndefined();
+
+    statusButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    compileButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+    expect(onRefreshWikiStatus).toHaveBeenCalledTimes(1);
+    expect(onCompileWiki).toHaveBeenCalledTimes(1);
+    setDreamSubTab("scene");
+  });
+
+  it("renders advanced results as preview-first snippets with query highlights", () => {
+    setDreamSubTab("advanced");
+    const container = renderInto(
+      buildProps({
+        shortTermEntries: [
+          {
+            key: "memory:memory/2026-04-05.md:7:9",
+            path: "memory/2026-04-05.md",
+            startLine: 7,
+            endLine: 9,
+            snippet: "Emma prefers shorter, lower-pressure check-ins.",
+            recallCount: 2,
+            dailyCount: 1,
+            groundedCount: 1,
+            totalSignalCount: 3,
+            lightHits: 1,
+            remHits: 0,
+            phaseHitCount: 1,
+            query: "shorter",
+          },
+        ],
+      }),
+    );
+
+    const item = container.querySelector(".dreams-advanced__item");
+    expect(item?.querySelector(".dreams-advanced__path")?.textContent).toContain(
+      "memory/2026-04-05.md",
+    );
+    expect(item?.querySelector(".dreams-advanced__snippet")?.textContent).toContain(
+      "Emma prefers shorter, lower-pressure check-ins.",
+    );
+    const marks = item?.querySelectorAll("mark") ?? [];
+    expect(marks.length).toBeGreaterThan(0);
+    expect([...marks].some((node) => node.textContent?.toLowerCase() === "shorter")).toBe(true);
+    setDreamSubTab("scene");
+  });
+
+  it("opens wiki previews at the matched lines and highlights the query", async () => {
+    setDreamSubTab("advanced");
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const onOpenWikiPage = vi.fn().mockResolvedValue({
+      title: "memory/2026-04-05.md",
+      path: "memory/2026-04-05.md",
+      updatedAt: "2026-04-05T11:00:00.000Z",
+      content: [
+        "line 1",
+        "line 2",
+        "line 3",
+        "line 4",
+        "line 5",
+        "line 6",
+        "Emma prefers shorter, lower-pressure check-ins.",
+        "line 8",
+        "line 9",
+      ].join("\n"),
+      truncated: false,
+    });
+    const container = renderInto(
+      buildProps({
+        shortTermEntries: [
+          {
+            key: "memory:memory/2026-04-05.md:7:9",
+            path: "memory/2026-04-05.md",
+            startLine: 7,
+            endLine: 9,
+            snippet: "Emma prefers shorter, lower-pressure check-ins.",
+            recallCount: 2,
+            dailyCount: 1,
+            groundedCount: 1,
+            totalSignalCount: 3,
+            lightHits: 1,
+            remHits: 0,
+            phaseHitCount: 1,
+            query: "shorter",
+          },
+        ],
+        onOpenWikiPage,
+      }),
+    );
+
+    const openButton = [...container.querySelectorAll("button")].find(
+      (node) => node.textContent?.trim() === "Open preview",
+    );
+    openButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onOpenWikiPage).toHaveBeenCalledWith({
+      lookup: "memory/2026-04-05.md",
+      startLine: 7,
+      endLine: 9,
+      highlightQuery: "shorter",
+    });
+    expect(container.querySelector(".dreams-diary__overlay-card")).not.toBeNull();
+    const overlayMarks = container.querySelectorAll(".dreams-diary__overlay-card mark");
+    expect(overlayMarks.length).toBeGreaterThan(0);
+    expect(scrollIntoView).toHaveBeenCalled();
     setDreamSubTab("scene");
   });
 
